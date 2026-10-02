@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from charclamp.domain.models import BurnShift, Clamp
 
 MIN_PEAK_TEMP_FOR_DRAWN = 400.0
@@ -9,6 +11,25 @@ MIN_PEAK_TEMP_FOR_DRAWN = 400.0
 
 class RuleError(ValueError):
     """业务规则校验失败。"""
+
+
+def parse_peak_temp(raw: str | None) -> float | None:
+    """
+    解析峰值温度输入：空串 -> None（未测）；
+    非数字、非有限值（nan/inf）、非正数一律挡下，抛 RuleError。
+    """
+    text = (raw or "").strip()
+    if text == "":
+        return None
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise RuleError(f"峰值温度不是有效数字：{text}") from None
+    if not math.isfinite(value):
+        raise RuleError("峰值温度必须是有限数值")
+    if value <= 0:
+        raise RuleError(f"峰值温度必须为正数，收到 {value:g}℃")
+    return value
 
 
 def latest_shift_for_clamp(clamp: Clamp) -> BurnShift | None:

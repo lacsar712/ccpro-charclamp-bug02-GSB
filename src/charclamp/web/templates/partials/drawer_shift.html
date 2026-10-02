@@ -14,8 +14,8 @@
     <label>开始时间
       <input name="started_at" type="datetime-local" />
     </label>
-    <label>峰值温度 ℃（可空）
-      <input name="peak_temp_c" type="number" step="0.1" />
+    <label>峰值温度 ℃（可空，须为正数）
+      <input name="peak_temp_c" type="number" step="0.1" min="0.1" />
     </label>
     <label>炭品等级
       <input name="charcoal_grade" value="B" />

@@ -7,11 +7,16 @@ from litestar import Controller, MediaType, Request, get, post
 from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.rules import (
+    RuleError,
+    assert_can_set_clamp_status,
+    can_mark_clamp_drawn,
+    parse_peak_temp,
+)
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -76,6 +81,20 @@ async def _load_timeline_context(clamp_id: int | None = None) -> dict[str, Any]:
         "status_labels": STATUS_LABELS,
         "site_name": site_name,
     }
+
+
+async def _render_peak_error(request: Request, clamp_id: int | None, message: str) -> Template:
+    """峰值保存失败：时间轴仍带完整剪影与卡片上下文，只多一条错误提示。"""
+    ctx = await _load_timeline_context(clamp_id)
+    return Template(
+        template_name="timeline.html",
+        context={
+            **ctx,
+            "user": request.user,
+            "flash": message,
+            "flash_cat": "error",
+        },
+    )
 
 
 class AuthController(Controller):
@@ -206,11 +225,14 @@ class ShiftController(Controller):
     ) -> Redirect:
         if not request.user:
             return Redirect("/login")
+        clamp_id = int(data["clamp_id"])
+        try:
+            peak = parse_peak_temp(data.get("peak_temp_c"))
+        except RuleError as exc:
+            _set_flash(request, str(exc), "error")
+            return Redirect(f"/?clamp_id={clamp_id}")
         started_raw = data.get("started_at") or ""
         started_at = datetime.fromisoformat(started_raw) if started_raw else datetime.utcnow()
-        peak_raw = (data.get("peak_temp_c") or "").strip()
-        peak = float(peak_raw) if peak_raw else None
-        clamp_id = int(data["clamp_id"])
         async with SessionLocal() as db:
             shift = BurnShift(
                 clamp_id=clamp_id,
@@ -238,45 +260,46 @@ class ShiftController(Controller):
         shift_id: int,
         data: dict[str, Any] = Body(media_type=RequestEncodingType.URL_ENCODED),
     ) -> Redirect | Template:
-        """改最近一班峰值：无行锁、弱校验；报错后时间轴白板。"""
+        """改最近一班峰值：正数校验 + 版本戳条件更新；报错页仍带完整时间轴。"""
         if not request.user:
             return Redirect("/login")
-        peak_raw = (data.get("peak_temp_c") or "").strip()
         clamp_id = _parse_optional_int(data.get("clamp_id"))
+        expected_version = _parse_optional_int(data.get("version"))
         try:
-            # 非数字才炸；0 / 负数仍可写入
-            peak = float(peak_raw) if peak_raw != "" else None
-            async with SessionLocal() as db:
-                result = await db.execute(
-                    select(BurnShift)
-                    .where(BurnShift.id == shift_id)
-                    .options(selectinload(BurnShift.clamp))
-                )
-                shift = result.scalar_one_or_none()
-                if not shift:
-                    return Redirect("/")
-                clamp_id = shift.clamp_id
-                # 无版本戳 / SELECT FOR UPDATE：连点重复提交都会「成功」并互相覆盖
-                shift.peak_temp_c = peak
-                await db.commit()
-            _set_flash(request, "峰值已保存", "ok")
-            return Redirect(f"/?clamp_id={clamp_id}")
-        except (TypeError, ValueError) as exc:
-            # 后台报错后时间轴只剩顶栏：剪影/卡片上下文被掏空
-            flash = f"峰值保存失败：{exc}"
-            return Template(
-                template_name="timeline.html",
-                context={
-                    "clamps": [],
-                    "shifts": [],
-                    "active_clamp_id": clamp_id,
-                    "status_labels": STATUS_LABELS,
-                    "site_name": "乌石岗焖烧坞",
-                    "user": request.user,
-                    "flash": flash,
-                    "flash_cat": "error",
-                },
+            peak = parse_peak_temp(data.get("peak_temp_c"))
+        except RuleError as exc:
+            return await _render_peak_error(request, clamp_id, str(exc))
+
+        async with SessionLocal() as db:
+            # 单条原子 UPDATE：带版本戳时，连点/并发重复提交只有一版能命中
+            stmt = (
+                update(BurnShift)
+                .where(BurnShift.id == shift_id)
+                .values(peak_temp_c=peak, version=BurnShift.version + 1)
+                .returning(BurnShift.clamp_id)
             )
+            if expected_version is not None:
+                stmt = stmt.where(BurnShift.version == expected_version)
+            row = (await db.execute(stmt)).first()
+            if row is not None:
+                await db.commit()
+                _set_flash(request, "峰值已保存", "ok")
+                return Redirect(f"/?clamp_id={row.clamp_id}")
+
+            # 没命中：班次不存在，或版本已被别的提交推进
+            shift = (
+                await db.execute(select(BurnShift).where(BurnShift.id == shift_id))
+            ).scalar_one_or_none()
+            if shift is None:
+                return Redirect("/")
+            clamp_id = shift.clamp_id
+            if shift.peak_temp_c == peak:
+                # 同值重复提交：幂等成功，库值稳定不再来回跳
+                _set_flash(request, "峰值已保存", "ok")
+                return Redirect(f"/?clamp_id={clamp_id}")
+        return await _render_peak_error(
+            request, clamp_id, "该班次峰值刚被其他提交更新，请刷新后重试"
+        )
 
 
 class ClampController(Controller):
