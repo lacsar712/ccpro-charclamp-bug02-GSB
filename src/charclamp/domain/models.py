@@ -63,6 +63,9 @@ class BurnShift(Base):
     clamp_id: Mapped[int] = mapped_column(ForeignKey("clamps.id"), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     peak_temp_c: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 乐观锁版本戳：每次峰值更新自增；条件更新 WHERE row_version=? 保证
+    # 同表单连点 / 重复提交只有一个请求生效，其余判定为冲突，不会互相覆盖。
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     charcoal_grade: Mapped[str] = mapped_column(String(40), nullable=False, default="B")
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 

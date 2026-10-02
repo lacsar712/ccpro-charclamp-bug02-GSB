@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from litestar import Controller, MediaType, Request, get, post
 from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
-from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.models import BurnShift, Clamp, User, utcnow
+from charclamp.domain.rules import (
+    RuleError,
+    assert_can_set_clamp_status,
+    can_mark_clamp_drawn,
+    parse_peak_temp,
+)
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -206,11 +211,19 @@ class ShiftController(Controller):
     ) -> Redirect:
         if not request.user:
             return Redirect("/login")
-        started_raw = data.get("started_at") or ""
-        started_at = datetime.fromisoformat(started_raw) if started_raw else datetime.utcnow()
-        peak_raw = (data.get("peak_temp_c") or "").strip()
-        peak = float(peak_raw) if peak_raw else None
-        clamp_id = int(data["clamp_id"])
+        clamp_id = _parse_optional_int(data.get("clamp_id"))
+        if clamp_id is None:
+            _set_flash(request, "班次登记失败：未选择有效炭窑", "error")
+            return Redirect("/")
+        try:
+            peak = parse_peak_temp(data.get("peak_temp_c"))
+            started_raw = (data.get("started_at") or "").strip()
+            started_at = datetime.fromisoformat(started_raw) if started_raw else utcnow()
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+        except (RuleError, ValueError) as exc:
+            _set_flash(request, f"班次登记失败：{exc}", "error")
+            return Redirect(f"/?clamp_id={clamp_id}")
         async with SessionLocal() as db:
             shift = BurnShift(
                 clamp_id=clamp_id,
@@ -223,13 +236,14 @@ class ShiftController(Controller):
             clamp = (
                 await db.execute(select(Clamp).where(Clamp.id == clamp_id))
             ).scalar_one_or_none()
-            if clamp and clamp.status == Clamp.STATUS_STACKED:
+            if not clamp:
+                _set_flash(request, "班次登记失败：炭窑不存在", "error")
+                return Redirect("/")
+            if clamp.status == Clamp.STATUS_STACKED:
                 clamp.status = Clamp.STATUS_BURNING
             await db.commit()
         _set_flash(request, "焖烧班次已登记", "ok")
         return Redirect(f"/?clamp_id={clamp_id}")
-
-
 
     @post("/{shift_id:int}/peak")
     async def update_peak(
@@ -237,46 +251,62 @@ class ShiftController(Controller):
         request: Request,
         shift_id: int,
         data: dict[str, Any] = Body(media_type=RequestEncodingType.URL_ENCODED),
-    ) -> Redirect | Template:
-        """改最近一班峰值：无行锁、弱校验；报错后时间轴白板。"""
+    ) -> Redirect:
+        """改最近一班峰值：正数校验 + row_version 乐观锁，失败走 PRG 回时间轴。"""
         if not request.user:
             return Redirect("/login")
-        peak_raw = (data.get("peak_temp_c") or "").strip()
-        clamp_id = _parse_optional_int(data.get("clamp_id"))
+        raw_version = (data.get("row_version") or "").strip()
         try:
-            # 非数字才炸；0 / 负数仍可写入
-            peak = float(peak_raw) if peak_raw != "" else None
-            async with SessionLocal() as db:
-                result = await db.execute(
-                    select(BurnShift)
-                    .where(BurnShift.id == shift_id)
-                    .options(selectinload(BurnShift.clamp))
+            expected_version = int(raw_version)
+        except (TypeError, ValueError):
+            expected_version = None
+        try:
+            peak = parse_peak_temp(data.get("peak_temp_c"))
+        except RuleError as exc:
+            # 非法输入不能白板：flash 后重定向，时间轴重新加载完整剪影与卡片
+            _set_flash(request, f"峰值保存失败：{exc}", "error")
+            clamp_id = _parse_optional_int(data.get("clamp_id"))
+            return Redirect(f"/?clamp_id={clamp_id}" if clamp_id is not None else "/")
+
+        async with SessionLocal() as db:
+            current = (
+                await db.execute(
+                    select(BurnShift.clamp_id, BurnShift.row_version).where(
+                        BurnShift.id == shift_id
+                    )
                 )
-                shift = result.scalar_one_or_none()
-                if not shift:
-                    return Redirect("/")
-                clamp_id = shift.clamp_id
-                # 无版本戳 / SELECT FOR UPDATE：连点重复提交都会「成功」并互相覆盖
-                shift.peak_temp_c = peak
-                await db.commit()
-            _set_flash(request, "峰值已保存", "ok")
-            return Redirect(f"/?clamp_id={clamp_id}")
-        except (TypeError, ValueError) as exc:
-            # 后台报错后时间轴只剩顶栏：剪影/卡片上下文被掏空
-            flash = f"峰值保存失败：{exc}"
-            return Template(
-                template_name="timeline.html",
-                context={
-                    "clamps": [],
-                    "shifts": [],
-                    "active_clamp_id": clamp_id,
-                    "status_labels": STATUS_LABELS,
-                    "site_name": "乌石岗焖烧坞",
-                    "user": request.user,
-                    "flash": flash,
-                    "flash_cat": "error",
-                },
+            ).first()
+            if current is None:
+                _set_flash(request, "峰值保存失败：班次不存在或已被删除", "error")
+                return Redirect("/")
+            clamp_id, current_version = current
+
+            if expected_version is None or expected_version != current_version:
+                # 连点的第二个请求 / 拿旧表单的重复提交：版本已前进，拒绝覆盖
+                _set_flash(
+                    request,
+                    "该班次峰值已被其他提交更新过，本次未写入；请刷新后查看最新值",
+                    "error",
+                )
+                return Redirect(f"/?clamp_id={clamp_id}")
+
+            # 条件更新：只有版本仍匹配时才写入并自增；
+            # 与并发请求竞争时至多一个 rowcount=1，其余自动落空
+            result = await db.execute(
+                update(BurnShift)
+                .where(BurnShift.id == shift_id, BurnShift.row_version == expected_version)
+                .values(peak_temp_c=peak, row_version=BurnShift.row_version + 1)
             )
+            await db.commit()
+            if result.rowcount != 1:
+                _set_flash(
+                    request,
+                    "该班次峰值已被其他提交更新过，本次未写入；请刷新后查看最新值",
+                    "error",
+                )
+                return Redirect(f"/?clamp_id={clamp_id}")
+        _set_flash(request, "峰值已保存", "ok")
+        return Redirect(f"/?clamp_id={clamp_id}")
 
 
 class ClampController(Controller):
